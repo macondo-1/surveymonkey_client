@@ -2,6 +2,8 @@ import requests
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import json
+from functools import wraps
 
 # Load environment variables from .env file
 _ROOT = Path(__file__).resolve().parent
@@ -28,33 +30,64 @@ class SurveyMonkeyClient:
     def _request(self, method, endpoint, **kwargs):
         if self.ratelimit_remaining is not None and int(self.ratelimit_remaining) <= RATELIMIT_THRESHOLD:
             raise RuntimeError(f"Daily rate limit nearly exhausted: {self.ratelimit_remaining} remaining")
-        response = self.session.request(method, f"{self.base_url}/{endpoint}", **kwargs)
+        
+        if endpoint.startswith("https"):
+            url = endpoint
+        else:
+            url = f"{self.base_url}/{endpoint}"
+
+        response = self.session.request(method, url, **kwargs)
+        response.raise_for_status()
         self.ratelimit_remaining = response.headers.get('X-Ratelimit-App-Global-Day-Remaining')
         return response
 
-    def get(self, endpoint):
-        return self._request("GET", endpoint)
+
 
     def post(self, endpoint, data):
         return self._request("POST", endpoint, json=data)
 
-    def survey_details(self, survey_id):
+    def get_survey_details(self, survey_id):
         return self.get(f"surveys/{survey_id}/details")
+
+
+    def get(self, endpoint) -> requests.Response:
+        return self._request("GET", endpoint)
+
+    def paginate(func) -> generator:
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            response = func(self, *args, **kwargs)
+            while True:
+                body = response.json()
+                yield from body.get("data", [])
+                next_link = body.get("links", {}).get("next")
+                if not next_link:
+                    break
+                response = self.session.get(next_link)
+        return wrapper
+
+    get_paginated = paginate(get)
+
+    def get_survey_answers(self, survey_id, per_page=100) -> generator:
+        return self.get_paginated(f"surveys/{survey_id}/responses/bulk?per_page={per_page}")
+
+    def get_survey_collectors(self, survey_id, per_page=100) -> generator:
+        return self.get_paginated(f"surveys/{survey_id}/collectors?per_page={per_page}")
+
 
 
 def main():
     sm_client = SurveyMonkeyClient()
-        # Example: Get details of a specific survey (Replace '123456789' with an actual survey ID)
     survey_id = "130579674"
     try:
-        details_response = sm_client.survey_details(survey_id)
-        if details_response.status_code == 200:
-            print(details_response.json())
-        else:
-            print(f"Failed to get survey details: {details_response.status_code} - {details_response.text}")
+        response = sm_client.get_survey_collectors(survey_id)
+
+        with open("temp/collectors_data.json", "w", encoding="utf-8") as file:
+            json.dump(list(response), file, indent=4)
+
     except RuntimeError as e:
         print(str(e))
 
-    
+
 if __name__ == "__main__":
     main()
