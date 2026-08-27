@@ -2,8 +2,10 @@ import requests
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 import json
 from functools import wraps
+from typing import Iterator
 
 # Load environment variables from .env file
 _ROOT = Path(__file__).resolve().parent
@@ -18,6 +20,7 @@ class SurveyMonkeyClient:
 
     def __init__(self, base_url=BASE_URL, account_id="SISINTL11"):
         self.base_url = base_url
+        self._allowed_host = urlparse(base_url).netloc
         self.account_id = account_id
         self.ratelimit_remaining = None
         self.bearer_token = os.environ.get(f"{self.account_id}_BEARER_TOKEN")
@@ -28,12 +31,31 @@ class SurveyMonkeyClient:
         })
         self._request("GET", "surveys?per_page=1")
 
+    def _check_host(self, url):
+        """
+        Raises if url's host isn't the same host as base_url.
+
+        self.session carries the bearer token as a default header, so any
+        request issued through it -- endpoint or a pagination `next` link
+        -- attaches the live credential to whatever host is requested. An
+        absolute URL from caller input or from an API response is not
+        guaranteed to stay on the expected host, so every such URL is
+        checked here before use rather than trusted implicitly.
+        """
+        host = urlparse(url).netloc
+        if host != self._allowed_host:
+            raise ValueError(
+                f"Refusing to send credentialed request to unexpected host "
+                f"{host!r} (expected {self._allowed_host!r}): {url!r}"
+            )
+
     def _request(self, method, endpoint, **kwargs):
         if self.ratelimit_remaining is not None and int(self.ratelimit_remaining) <= RATELIMIT_THRESHOLD:
             raise RuntimeError(f"Daily rate limit nearly exhausted: {self.ratelimit_remaining} remaining")
-        
+
         if endpoint.startswith("https"):
             url = endpoint
+            self._check_host(url)
         else:
             url = f"{self.base_url}/{endpoint}"
 
@@ -56,7 +78,7 @@ class SurveyMonkeyClient:
     def get(self, endpoint) -> requests.Response:
         return self._request("GET", endpoint)
 
-    def paginate(func) -> generator:
+    def paginate(func) -> Iterator[dict]:
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             response = func(self, *args, **kwargs)
@@ -66,18 +88,19 @@ class SurveyMonkeyClient:
                 next_link = body.get("links", {}).get("next")
                 if not next_link:
                     break
+                self._check_host(next_link)
                 response = self.session.get(next_link)
         return wrapper
 
     get_paginated = paginate(get)
 
-    def get_survey_answers(self, survey_id, per_page=100) -> generator:
+    def get_survey_answers(self, survey_id, per_page=100) -> Iterator[dict]:
         return self.get_paginated(f"surveys/{survey_id}/responses/bulk?per_page={per_page}")
 
-    def get_survey_collectors(self, survey_id, per_page=100) -> generator:
+    def get_survey_collectors(self, survey_id, per_page=100) -> Iterator[dict]:
         return self.get_paginated(f"surveys/{survey_id}/collectors?per_page={per_page}")
 
-    def get_account_surveys(self, per_page=100) -> generator:
+    def get_account_surveys(self, per_page=100) -> Iterator[dict]:
         return self.get_paginated(f"surveys?per_page={per_page}")
 
 
